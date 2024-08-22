@@ -60,9 +60,7 @@ clusters = [cluster for cluster in clusters if len(cluster) >= 2]
 # 计算成簇粒子的数量N1
 N1 = 0
 for cluster in clusters:
-    N1 += len(cluster)
-
-    
+    N1 += len(cluster)  
 N2 = 0
 computed_pairs = set()  # 用于存储已计算过的粒子对的索引
 
@@ -85,12 +83,9 @@ for cluster in clusters:
             if pair not in computed_pairs:  # 检查是否已计算过这个粒子对
                 count += 1
                 computed_pairs.add(pair)  # 将粒子对索引添加到已计算集合中
-
     N2 += count
 
-
 print(N1)
-    
 print(N2)
 print(N2/N1)
 print(N1/625)
