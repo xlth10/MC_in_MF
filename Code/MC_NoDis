@@ -1,0 +1,207 @@
+import numpy as np
+import numba as nb
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import pandas as pd
+
+class MagneticFluidSimulation:
+    def __init__(self, N, L, d_p, delta, N_steps):
+        # 初始化模拟参数
+        self.N = N  # 粒子数
+        self.L = L  # 系统大小
+        self.d_p = d_p  # 粒子直径
+        self.delta = delta  # 活性剂厚度
+        self.d = d_p + 2 * delta  # 粒子间距
+        self.N_steps = N_steps  # Metropolis采样的总步数
+        self.positions, self.m = self.generate_particles()  # 生成初始粒子位置和磁矩
+
+    def generate_particles(self):
+        # 生成粒子初始位置和磁矩方向
+        c = self.L / np.sqrt(self.N)  # 计算粒子间隔
+        x, y = np.meshgrid(np.arange(0, self.L, c), np.arange(0, self.L, c))
+        positions = np.vstack((x.ravel(), y.ravel())).T  # 生成等间距的点阵
+        positions += np.random.normal(loc=c / 10, scale=c / 20, size=(self.N, 2))  # 添加随机扰动
+        theta = np.random.uniform(low=0, high=2 * np.pi, size=self.N)  # 随机生成N个角度
+        m = np.vstack((np.cos(theta), np.sin(theta))).T  # 转化为磁矩方向单位向量
+        return positions, m
+
+    @staticmethod
+    @nb.njit(fastmath=True)
+    def calculate_U_hi(m_i):
+        # 计算外加磁场作用势
+        lambda_h = 2.19e-20  # 磁场强度
+        h = np.array([0, 1])  # 磁场方向
+        return -lambda_h * (m_i[0] * h[0] + m_i[1] * h[1])
+
+    @staticmethod
+    @nb.njit(fastmath=True)
+    def calculate_U_mij(m_i, m_j, r_ij, d_p):
+        # 计算磁偶极子相互作用势
+        lambda_m = 4.7524e-21  # 磁偶极子作用势强度
+        r_ij_norm = np.linalg.norm(r_ij)  # 计算粒子间距
+        t_ij = r_ij / r_ij_norm  # 归一化向量
+        term1 = np.dot(np.ascontiguousarray(m_i), np.ascontiguousarray(m_j))
+        term2 = 3 * np.dot(m_i, t_ij) * np.dot(m_j, t_ij)
+        if d_p < r_ij_norm <= 10 * d_p:
+            return lambda_m * ((d_p / r_ij_norm) ** 3) * (term1 - term2)
+        else:
+            return 0
+
+    @staticmethod
+    @nb.njit(fastmath=True)
+    def calculate_U_vij(r_ij, d_p, delta, d):
+        # 计算活性剂排斥势
+        lambda_v = 6.5e-19  # 活性剂排斥势强度
+        term1 = 2 + (np.linalg.norm(r_ij) / delta) * np.log(np.linalg.norm(r_ij) / d)
+        term2 = (np.linalg.norm(r_ij) - d_p) / delta
+        if d_p < np.linalg.norm(r_ij) <= d:
+            return lambda_v * (term1 - term2)
+        else:
+            return 0
+
+    def calculate_energy(self, positions, m):
+        # 计算系统的总势能
+        U_h = 0  # 外加磁场作用势
+        U_m = 0  # 磁偶极子相互作用势
+        U_v = 0  # 表面活性剂的排斥势
+        for i in nb.prange(self.N):
+            U_h += self.calculate_U_hi(m[i])
+            for j in range(i + 1, self.N):
+                r_ij = positions[i] - positions[j]
+                U_m += self.calculate_U_mij(m[i], m[j], r_ij, self.d_p)
+                U_v += self.calculate_U_vij(r_ij, self.d_p, self.delta, self.d)
+        energy_total = U_v + U_m + U_h
+        return energy_total, U_h, U_m, U_v
+
+    def metropolis(self):
+        # Metropolis采样过程
+        accepted = 0  # 接受的状态数
+        kb = 1.38e-23  # 玻尔兹曼常数
+        T = 300  # 温度
+        beta = 1 / (kb * T)  # 计算beta值
+        energy_list = []  # 记录能量变化
+        U_h_list = []
+        U_m_list = []
+        U_v_list = []
+        acceptance_list = []
+        fig = 0
+        with tqdm(total=self.N_steps, ascii=True) as pbar:
+            for step in range(self.N_steps):
+                pbar.update(1)  # 更新进度条
+                energy_i, U_h, U_m, U_v = self.calculate_energy(self.positions, self.m)  # 计算当前能量
+                alpha = np.random.randint(self.N)  # 随机选取一个粒子
+                a = 0.5 * self.d  # 最大位移
+                gamma = np.random.random()
+                phi = np.random.uniform(0, 2 * np.pi)
+                delta_position = np.array([a * gamma * np.cos(phi), a * gamma * np.sin(phi)])
+                new_positions = self.positions.copy()
+                for k in range(2):
+                    new_positions[alpha][k] += delta_position[k]
+                    if new_positions[alpha][k] < 0:
+                        new_positions[alpha][k] += self.L
+                    elif new_positions[alpha][k] > self.L:
+                        new_positions[alpha][k] -= self.L
+                new_positions[alpha] += delta_position
+
+                # 碰撞检测
+                has_collision = False
+                for i in range(len(self.positions)):
+                    if i != alpha:
+                        if np.linalg.norm(new_positions[alpha] - new_positions[i]) < self.d:
+                            has_collision = True
+                            break
+                if not has_collision:
+                    energy_j, _, _, _ = self.calculate_energy(new_positions, self.m)
+                    delta_E1 = energy_j - energy_i
+                    if delta_E1 <= 0:
+                        self.positions = new_positions
+                        energy_i = energy_j
+                        accepted += 1
+                        R1 = 1
+                        P1 = 1
+                    else:
+                        P1 = np.exp(-beta * delta_E1)
+                        R1 = np.random.random()
+                        if R1 <= P1:
+                            self.positions = new_positions
+                            energy_i = energy_j
+                            accepted += 1
+
+                new_m = self.m.copy()
+                theta = np.arctan2(self.m[alpha][1], self.m[alpha][0])
+                c = np.pi / 18  # 磁矩最大转动角度
+                lamda = 2 * np.random.random() - 1
+                delta_theta = lamda * c
+                new_theta = theta + delta_theta
+                new_m[alpha][0] = np.cos(new_theta)
+                new_m[alpha][1] = np.sin(new_theta)
+                new_m[alpha] = new_m[alpha] / np.linalg.norm(new_m[alpha])
+
+                energy_k, _, _, _ = self.calculate_energy(self.positions, new_m)
+                delta_E2 = energy_k - energy_i
+                if delta_E2 <= 0:
+                    self.m = new_m
+                    energy_i = energy_k
+                    accepted += 1
+                    R2 = 1
+                    P2 = 1
+                else:
+                    P2 = np.exp(-beta * delta_E2)
+                    R2 = np.random.random()
+                    if R2 <= P2:
+                        self.m = new_m
+                        energy_i = energy_k
+                        accepted += 1
+                acceptance = int(R1 <= P1 and R2 <= P2)
+                acceptance_list.append(acceptance)
+                energy_list.append(energy_i)
+                U_h_list.append(U_h)
+                U_m_list.append(U_m)
+                U_v_list.append(U_v)
+
+                if (step + 1) % 5000 == 0:
+                    plt.figure(figsize=(15, 15))
+                    plt.scatter(self.positions[:, 0], self.positions[:, 1], s=100, alpha=0.7)
+                    plt.xlim([0, self.L])
+                    plt.ylim([0, self.L])
+                    for i in range(self.N):
+                        plt.arrow(self.positions[i, 0], self.positions[i, 1],
+                                  self.m[i, 0], self.m[i, 1],
+                                  head_width=60, head_length=60, color='r', alpha=0.7)
+                    plt.title(f"step{step + 1}")
+                    plt.savefig(f"particles_{fig}.png")
+                    plt.close()
+                    plt.figure(figsize=(20, 10))
+                    plt.plot(range(len(energy_list)), energy_list, label='Total Energy')
+                    plt.plot(range(len(U_h_list)), U_h_list, label='U_h')
+                    plt.plot(range(len(U_m_list)), U_m_list, label='U_m')
+                    plt.plot(range(len(U_v_list)), U_v_list, label='U_v')
+                    plt.xlabel('Step number')
+                    plt.ylabel('Energy')
+                    plt.title('Energy vs. Step number')
+                    plt.legend()
+                    plt.savefig(f"energy_{fig}.png")
+                    plt.close()
+                    fig += 1
+                    df_m = pd.DataFrame({'m_x': self.m[:, 0], 'm_y': self.m[:, 1]})
+                    df_acceptance = pd.DataFrame({'Acceptance': acceptance_list})
+                    df_positions = pd.DataFrame({'X': self.positions[:, 0], 'Y': self.positions[:, 1]})
+                    df_energy = pd.DataFrame({'Energy': energy_list})
+                    df_U_h = pd.DataFrame({'U_h': U_h_list})
+                    df_U_m = pd.DataFrame({'U_m': U_m_list})
+                    df_U_v = pd.DataFrame({'U_v': U_v_list})
+
+                    with pd.ExcelWriter(f'D1_check_{fig}.xlsx') as writer:
+                        df_acceptance.to_excel(writer, sheet_name='Acceptance', index=False)
+                        df_m.to_excel(writer, sheet_name='m', index=False)
+                        df_positions.to_excel(writer, sheet_name='Positions', index=False)
+                        df_energy.to_excel(writer, sheet_name='Energy', index=True)
+                        df_U_h.to_excel(writer, sheet_name='U_h', index=True)
+                        df_U_m.to_excel(writer, sheet_name='U_m', index=True)
+                        df_U_v.to_excel(writer, sheet_name='U_v', index=True)
+
+        return self.positions, self.m, energy_list, U_h_list, U_m_list, U_v_list, acceptance_list
+
+# 设定参数并运行
+simulation = MagneticFluidSimulation(N=625, L=640, d_p=10, delta=1.5, N_steps=1000000)
+final_positions, final_m, energy_list, U_h_list, U_m_list, U_v_list, acceptance_list = simulation.metropolis()
